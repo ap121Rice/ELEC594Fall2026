@@ -1,0 +1,168 @@
+% Final report, ELEC 594 (Fall 2026)
+% Build: pdflatex main && bibtex main && pdflatex main && pdflatex main   (or: latexmk -pdf main)
+% IEEEtran.cls and IEEEtran.bst are included in this folder; figures are in figures/
+% (figures/make_figures.py regenerates figures/latency.pdf).
+\documentclass[conference]{IEEEtran}
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{textcomp}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\cdfour}{CD4\textsuperscript{+}}
+
+\begin{document}
+
+\title{On-Device \cdfour{} T Cell Counting on iPhone:\\Deploying a Microfluidic Cytometer's Deep-Learning Model at the Edge}
+
+\author{\IEEEauthorblockN{Anh Pham}
+\IEEEauthorblockA{Department of Electrical and Computer Engineering\\
+Rice University, Houston, TX, USA}}
+
+\maketitle
+
+\begin{abstract}
+\cdfour{} T cell counts guide the care of people living with HIV, but counting them still relies on flow cytometers in centralized laboratories. A recent AI-enabled microfluidic cytometer counts bead-labeled \cdfour{} T cells in microscope video with a YOLOv5 detector, but its analysis runs on a cloud GPU. We moved this analysis onto an iPhone. We ported the authors' notebook to reproducible scripts, converted the trained detector to Core ML with built-in non-maximum suppression, compressed it with 8-bit weight quantization, and built a SwiftUI app that counts cells in photos and videos fully offline. On an iPhone 15 Plus, the model processes a 1920$\times$1440 frame in 23.5\,ms (43 frames/s) on the Neural Engine, faster than the 35--55\,ms reported for the original cloud GPU setup, and it matches the original model on all 26 cells in our test images. INT8 weights reduce the model from 15.5 to 8.5\,MB. Code: \url{https://github.com/ap121Rice/ELEC594Fall2026}.
+\end{abstract}
+
+\section{Introduction}
+
+The \cdfour{} T cell count is a central measurement in HIV care: the World Health Organization defines advanced HIV disease by a count below 200\,cells/mm\textsuperscript{3} and recommends \cdfour{} testing when people enter care~\cite{who2017}. Flow cytometry is the gold standard for this measurement, but it needs expensive instruments, trained staff and a laboratory, which limits access where the need is often greatest~\cite{dixit2025}.
+
+Dixit \emph{et al.}~\cite{dixit2025} recently reported an AI-enabled microfluidic cytometer that removes much of this complexity. Blood is mixed with anti-\cdfour{} antibody-coated microbeads, and the sample flows through a chip by gravity-driven slug flow, with no pump. A microscope camera records the flow at 1920$\times$1440 pixels, and a YOLOv5 object detector~\cite{redmon2016,yolov5} finds the bead-bound cells; counts agree with flow cytometry to within 10\%. However, the video is analyzed on a computer, using a T4 GPU in Google Colaboratory, at 35--55\,ms per frame~\cite{dixit2025}. The device therefore still depends on a network connection and a remote GPU, and patient images leave the site where they are captured.
+
+Edge computing moves computation to where data is produced~\cite{shi2016}. Smartphones are attractive edge devices for diagnostics: they have cameras, are widely available and can serve as low-cost microscopes~\cite{zhu2011}. Modern phones also include neural accelerators, and model compression, through efficient architectures~\cite{howard2017}, quantization~\cite{jacob2018,nagel2021} and pruning~\cite{han2016}, makes it possible to fit deep networks on them. Apple's Core ML Tools converts and compresses individual models for iPhone~\cite{coremlquant}, but the full path from a research notebook to a validated app on a phone is still manual and easy to get wrong.
+
+In this project we took the trained detector from~\cite{dixit2025} and ran it entirely on an iPhone. Our contributions are: (1)~a reproducible pipeline that ports the authors' notebook to command-line scripts and reproduces its counts exactly; (2)~a Core ML conversion with built-in non-maximum suppression (NMS) and INT8 weight quantization, including a failure mode of default quantization settings in YOLO detection heads and its fix; (3)~an iPhone app that counts cells in photos and videos from the camera, photo library or files, fully offline; and (4)~a benchmark of speed, size and agreement across server GPU and CPU and the iPhone's compute units.
+
+\section{Methods}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=black!60, rounded corners=2pt, align=center, font=\scriptsize, text width=1.62cm, minimum height=1.25cm, inner sep=2pt},
+  arr/.style={-{Stealth[length=4pt]}, black!70}]
+\node[box] (a) {Authors' notebook\\+ trained YOLOv5s};
+\node[box, right=0.28cm of a] (b) {HPC scripts:\\detect, count,\\benchmark};
+\node[box, right=0.28cm of b] (c) {Core ML export:\\FP16 / INT8\\+ NMS};
+\node[box, right=0.28cm of c] (d) {iPhone app:\\analyze and\\benchmark};
+\draw[arr] (a) -- (b); \draw[arr] (b) -- (c); \draw[arr] (c) -- (d);
+\end{tikzpicture}
+\caption{Pipeline from the authors' Colab notebook to an offline iPhone app.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Original model and data}
+The authors shared their trained weights, Colab notebook, training configuration and logs, and two microscope test images (3264$\times$2464 pixels). The model is YOLOv5s~\cite{yolov5} with one class, ``cell'' (a \cdfour{} T cell with beads attached), 7.0\,M parameters and 15.8\,GFLOPs at 640$\times$640. It was trained on 640$\times$640 crops of video frames; the training log reports precision 0.90, recall 0.92 and mAP@0.5 of 0.956 on the validation set, with the best weights at epoch 143 (training stopped early at epoch 243). We received no videos or labeled data, so we did not retrain the model. While reviewing the logs we found that about 1,000 of the 1,766 validation images had been skipped during training because their label files held an extra column; we wrote a script that fixes these files for future training.
+
+\subsection{Reproducible pipeline}
+We rewrote the notebook as Python scripts built on the YOLOv5 code and ran them with SLURM on Rice University's HPC cluster (Fig.~\ref{fig:pipeline}). Detection follows the notebook: each full 1920-pixel frame is letterboxed (aspect ratio kept, gray padding), which keeps cells at their training size of about 20 pixels, with confidence threshold 0.1 and NMS IoU threshold 0.45. Counting follows the notebook's final method: detections with confidence $\geq 0.32$ are kept; after skipping the first 500 and last 100 frames, a sample is taken every 11 frames; each sample counts the busiest frame within $\pm 4$ frames; and the concentration is $10\,\bar{n}/0.027744$\,cells/$\mu$L, where $\bar{n}$ is the mean count per sample and the constants are the dilution and imaged volume from the notebook. Given the same detections, our counting script reproduced the notebook's code exactly. A benchmark script measures size, latency and agreement for each precision on GPU and CPU.
+
+\subsection{Core ML conversion}
+We traced the model with PyTorch and converted it with Core ML Tools 9.0~\cite{coremlquant} to an ML program with a fixed 1920$\times$1440 image input and FP16 weights and compute. NMS is appended as a second pipeline stage with IoU and confidence thresholds as inputs, so the app receives final boxes. Conversion ran on Linux; it required NumPy below 2.4, because a NumPy change breaks the converter.
+
+\subsection{Quantization}
+We applied post-training, weight-only linear quantization~\cite{jacob2018,nagel2021}: each output channel of a weight tensor gets one scale, $s = \max|w|/127$, and weights are stored as $\mathrm{round}(w/s) \in [-127, 127]$. Tensors with 2,048 or fewer elements stay in FP16. At run time the weights are expanded back to FP16 before computation, so this mode reduces size rather than arithmetic. The first version applied the default setting, which quantizes every large constant. In YOLOv5 this includes the detection head's decoding constants: the grid of cell offsets (about 0 to 240 at stride 8) and the anchor sizes. With one scale per tensor, grid offsets are rounded to steps of about 1.9 cells, which shifts boxes by up to about 7 pixels. We therefore restricted quantization to the 57 convolution weight tensors. To predict on-device accuracy before deploying, we applied the same rounding to the PyTorch weights and ran the result on the GPU (``simulated INT8'').
+
+\subsection{iPhone app}
+The SwiftUI app has two tabs (Fig.~\ref{fig:images}b,c). The \emph{Benchmark} tab loads both Core ML models with three compute settings: all units (which uses the Neural Engine), CPU and GPU, and CPU only. For each test image it runs 3 warm-up and 20 timed predictions and reports the median time and the agreement with the PyTorch reference. To give both platforms identical pixels, the test images were center-cropped to 4:3 and resized to 1920$\times$1440, and the PyTorch reference was computed on these copies. The \emph{Analyze} tab takes a photo or video from the camera, photo library or Files. Each image or video frame is letterboxed into the 1920$\times$1440 input with Core Image (portrait images are rotated to landscape) and run on the Neural Engine. Photos show the cell count with boxes and an adjustable confidence threshold; videos are decoded frame by frame and counted with the notebook's method above. Results can be exported as CSV files. All processing happens on the phone.
+
+\subsection{Metrics}
+Latency is the median time per 1920$\times$1440 frame at batch size 1; on the iPhone it includes NMS, which adds under 1\,ms on the server. Size is the stored model size. Agreement compares cells at confidence $\geq 0.32$ with the FP32 PyTorch model: two boxes match if their intersection over union is at least 0.5 (greedy one-to-one matching). Server measurements used an NVIDIA H100 NVL GPU partition (MIG 3g.47gb) and 32 CPU threads; phone measurements used an iPhone 15 Plus (A16 chip) on iOS 18.7.
+
+\section{Results}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[height=2.05in]{figures/detections.jpg}\hfill
+\includegraphics[height=2.05in]{figures/phone_benchmark.jpg}\hfill
+\includegraphics[height=2.05in]{figures/app_ui.jpg}
+\caption{(a) Detections (green, confidence $\geq 0.32$) on test image 1: 13 bead-bound \cdfour{} T cells; free beads and unlabeled cells are ignored. (b) Benchmark tab on the iPhone 15 Plus: both models on three compute settings, all 26 cells matched. (c) Analyze tab: camera, photo library, Files and test-image inputs, model choice and confidence threshold.}
+\label{fig:images}
+\end{figure*}
+
+\subsection{Reproduction}
+On the two test images, the original model finds 13 and 13 cells at confidence $\geq 0.32$, both on the original photos and on the 1920$\times$1440 copies used for the phone. The boxes fall on cells with beads attached, while free beads and pale cells without beads are not detected (Fig.~\ref{fig:images}a), consistent with the bead-labeling assay.
+
+\subsection{Server benchmark}
+Table~\ref{tab:server} summarizes the server results. FP16 on the GPU takes 4.2\,ms of inference per frame, and the simulated INT8 model finds the same 26 cells as FP32. On 32 CPU threads, FP32 inference takes 198\,ms per frame. The stored weights take 28.1\,MB in FP32, 14.0\,MB in FP16 and 7.0\,MB with INT8 convolution weights.
+
+\begin{table}[t]
+\centering
+\caption{Server results (1920$\times$1440 input, batch 1)}
+\label{tab:server}
+\footnotesize
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+Device & Precision & Weights (MB) & Inference (ms) & Cells matched \\
+\midrule
+GPU & FP32 & 28.1 & 5.6 & 26/26 \\
+GPU & FP16 & 14.0 & 4.2 & 26/26 \\
+GPU & Sim.\ INT8 & 7.0 & 4.2\textsuperscript{a} & 26/26 \\
+CPU & FP32 & 28.1 & 198.3 & 26/26 \\
+\bottomrule
+\multicolumn{5}{@{}l}{\textsuperscript{a}\scriptsize Same arithmetic as FP16; only the rounding of weights is simulated.}
+\end{tabular}
+\end{table}
+
+\subsection{iPhone benchmark}
+Table~\ref{tab:phone} shows the on-device results. With the Neural Engine, the FP16 model takes 23.5\,ms per frame (43 frames/s), 5--6$\times$ faster than the phone's GPU or CPU. After the fix, the INT8 model matches all 26 cells on every compute setting, and it is 45\% smaller (8.5 vs.\ 15.5\,MB), but it is not faster (24.1 vs.\ 23.5\,ms). The first INT8 version, which also quantized the detection head's constants, found 45--47 ``cells'' instead of 26: all real cells were still detected, but about 20 duplicate boxes survived NMS. Loading a model for the Neural Engine for the first time after installation took 1.2--4.5\,s, compared with 0.1--0.3\,s for CPU and GPU, because iOS prepares the model for the Neural Engine on first use. Fig.~\ref{fig:latency} compares latency across all platforms.
+
+\begin{table}[t]
+\centering
+\caption{iPhone 15 Plus results (1920$\times$1440 input, median of 40 runs)}
+\label{tab:phone}
+\footnotesize
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+Model (size) & Compute & ms/frame & Cells & Matched \\
+\midrule
+FP16 (15.5\,MB) & Neural Engine & 23.5 & 26 & 26 \\
+ & GPU & 119.4 & 26 & 26 \\
+ & CPU & 145.7 & 26 & 26 \\
+INT8 (8.5\,MB) & Neural Engine & 24.1 & 26 & 26 \\
+ & GPU & 119.1 & 26 & 26 \\
+ & CPU & 154.3 & 26 & 26 \\
+\midrule
+INT8, initial (7.9\,MB) & Neural Engine & 24.2 & 45 & 26 \\
+ & GPU & 119.3 & 46 & 25 \\
+ & CPU & 155.6 & 47 & 26 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/latency.pdf}
+\caption{Time per 1920$\times$1440 frame for the same model on each platform; iPhone results are for the iPhone 15 Plus (FP16). The Colab T4 value is from the authors' notebook log (FP32, inference plus pre-processing and NMS).}
+\label{fig:latency}
+\end{figure}
+
+\subsection{App}
+The app runs on the iPhone 15 Plus with no network connection (Fig.~\ref{fig:images}c). Photos and videos from the camera, photo library and Files are processed on the device, and the bundled test images give a quick check without new data.
+
+\section{Discussion}
+
+The main result is that the published detector runs on a phone in real time without any loss of agreement with the original model. At 43 frames/s, the phone processes frames faster than the cytometer records them (15 frames/s~\cite{dixit2025}); inference on a 2,500-frame recording would take about 1\,min on the phone, compared with about 140\,s for inference plus 180\,s of post-processing in the original setup~\cite{dixit2025}. The comparison with the T4 should be read with care: the original setup ran PyTorch in FP32, which does not use the T4's FP16 tensor cores, so an optimized GPU would be faster. Our claim is that the phone is fast enough for the task, not that it is faster than a GPU.
+
+Weight-only INT8 behaved differently on the phone than on the server. It nearly halved the model size, but because weights are expanded to FP16 before computation, the A16 Neural Engine does the same FP16 arithmetic and latency is unchanged. Apple reports faster 8-bit arithmetic when activations are also quantized, but only on newer chips (A17 Pro and M4)~\cite{coremlperf}. Larger size reductions would need 4-bit weights or pruning~\cite{han2016}, ideally with retraining. The quantization bug is a general lesson: default settings quantize every large constant, and a detection head stores box-decoding constants that need full precision. Size and speed looked normal, so only checking the detections themselves revealed the problem. After the fix, the simulated INT8 model on the GPU predicted the phone's result exactly, which makes it a useful check before deployment.
+
+This work has clear limitations. Agreement was measured on two test images with 26 cells and against the original model, not against ground truth or flow cytometry. Without videos from the device, the cells/$\mu$L path in the app is untested on real samples, and we did not measure sustained speed over a full recording, when the phone may warm up and slow down. The notebook's counting method also differs from the one described in the paper (mean count over frames that contain at least one cell, with a 0.35 threshold and a size filter~\cite{dixit2025}); which one produced the published counts needs to be confirmed with the authors. Finally, about half of the original validation images were skipped during training, so the published validation metrics rest on a smaller set than intended.
+
+Next steps are to validate the full app on device videos against flow cytometry, count directly from the live camera stream, retrain with the corrected labels, and test smaller models, tiling and full 8-bit quantization on newer iPhones.
+
+\section*{Acknowledgments}
+We thank D.\,D. Dixit, T.\,P. Graf, K.\,J. McHugh and P.\,B. Lillehoj for sharing the trained model, notebook and test images from~\cite{dixit2025}, and Rice University's Center for Research Computing for computing resources. We used Claude (Anthropic) to help write code and draft this report.
+
+\section*{CRediT Author Statement}
+\textbf{Anh Pham:} Conceptualization, Methodology, Software, Validation, Formal analysis, Investigation, Visualization, Writing -- original draft, Writing -- review \& editing.
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}
